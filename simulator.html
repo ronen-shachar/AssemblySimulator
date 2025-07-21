@@ -4,9 +4,6 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Mini Assembly Simulator</title>
-  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <style>
     body {
       font-family: monospace;
@@ -143,11 +140,41 @@
 </head>
 <body>
   <div id="root"></div>
-  <script type="text/babel">
+  <script>
 
 const REG_NAMES = ["R0", "R1", "R2", "R3"];
 const INIT_REGS = { R0: 0, R1: 0, R2: 0, R3: 0, FLAG: 0 };
 const INIT_MEM = Array(100).fill(0);
+
+// Application state
+let initialCode = `start:
+  mov R0 10 ; set R0 to 10
+  mov R1 0
+loop:
+  cmp R0 R1
+  je end
+  push R0
+  mov [20+R1] R0
+  mov R2 [20+R1]
+  pop R3
+  mov R1 R1+1
+  jmp loop
+end:
+  halt
+`;
+
+let state = {
+  code: initialCode,
+  program: parseProgram(initialCode),
+  registers: {...INIT_REGS},
+  memory: [...INIT_MEM],
+  stack: [],
+  pc: 0,
+  halted: false,
+  error: "",
+  editMode: true,
+  highlightLine: null
+};
 
 function parseProgram(code) {
   // Remove comments, parse labels, split instructions
@@ -172,377 +199,453 @@ function evalCmp(a, b) {
   else return 0;
 }
 
-// Main Simulator
-function Simulator() {
-  // Editor state
-  const [code, setCode] = React.useState(
-`start:
-  mov R0 10 ; set R0 to 10
-  mov R1 0
-loop:
-  cmp R0 R1
-  je end
-  push R0
-  mov [20+R1] R0
-  mov R2 [20+R1]
-  pop R3
-  mov R1 R1+1
-  jmp loop
-end:
-  halt
-`);
-  // Parsed program
-  const [program, setProgram] = React.useState(parseProgram(code));
+// Helper: get register or value
+function getVal(v, regCopy) {
+  if (REG_NAMES.includes(v)) return regCopy[v];
+  if (/^\d+$/.test(v)) return parseInt(v);
+  if (/^R\d\+\d+$/.test(v)) { // e.g. R1+1
+    let [r, add] = v.split('+');
+    return (regCopy[r]||0) + parseInt(add);
+  }
+  throw new Error(`Invalid value: ${v}`);
+}
 
-  // Machine state
-  const [registers, setRegisters] = React.useState({...INIT_REGS});
-  const [memory, setMemory] = React.useState([...INIT_MEM]);
-  const [stack, setStack] = React.useState([]);
-  const [pc, setPC] = React.useState(0);
-  const [halted, setHalted] = React.useState(false);
-  const [error, setError] = React.useState("");
-  const [editMode, setEditMode] = React.useState(true);
-  const [highlightLine, setHighlightLine] = React.useState(null);
+// Helper: get address [base+Rx]
+function parseAddr(expr, regCopy) {
+  let m = expr.match(/^(\d+)\+([Rr]\d)$/);
+  if (!m) return null;
+  let base = parseInt(m[1]);
+  let reg = m[2].toUpperCase();
+  if (!REG_NAMES.includes(reg)) return null;
+  let addr = base + regCopy[reg];
+  if (addr < 0 || addr >= 100) {
+    throw new Error(`Memory address out of bounds: ${addr}`);
+  }
+  return addr;
+}
 
-  // For editing before run
-  const handleRegEdit = (reg, val) => {
-    let v = Number(val) || 0;
-    setRegisters(r => ({...r, [reg]:v}));
-  };
-  const handleMemEdit = (idx, val) => {
-    let v = Number(val) || 0;
-    setMemory(m => {
-      let copy = [...m];
-      copy[idx] = v;
-      return copy;
-    });
-  };
+// Update functions
+function updateState(newState) {
+  Object.assign(state, newState);
+  render();
+}
 
-  // Re-parse on code change
-  React.useEffect(() => {
-    setProgram(parseProgram(code));
-  }, [code]);
+function updateCode(newCode) {
+  state.code = newCode;
+  state.program = parseProgram(newCode);
+  render();
+}
 
-  // Start/Reset
-  const handleReset = () => {
-    setRegisters({...INIT_REGS});
-    setMemory([...INIT_MEM]);
-    setStack([]);
-    setPC(0);
-    setHalted(false);
-    setError("");
-    setEditMode(true);
-    setHighlightLine(null);
-  };
+function handleRegEdit(reg, val) {
+  let v = Number(val) || 0;
+  state.registers[reg] = v;
+  render();
+}
 
-  // Run (step-by-step)
-  const handleStep = () => {
-    if (halted || pc >= program.instructions.length) return;
-    setError("");
-    let instr = program.instructions[pc].raw;
-    setHighlightLine(program.instructions[pc].lineNumber);
+function handleMemEdit(idx, val) {
+  let v = Number(val) || 0;
+  state.memory[idx] = v;
+  render();
+}
 
-    // Parse instruction
-    let words = instr.split(/\s+/);
-    let op = words[0].toLowerCase();
+function handleReset() {
+  updateState({
+    registers: {...INIT_REGS},
+    memory: [...INIT_MEM],
+    stack: [],
+    pc: 0,
+    halted: false,
+    error: "",
+    editMode: true,
+    highlightLine: null
+  });
+}
 
-    let nextPC = pc + 1;
-    let regCopy = {...registers};
-    let memCopy = [...memory];
-    let stackCopy = [...stack];
-    let err = "";
+function handleStep() {
+  if (state.halted || state.pc >= state.program.instructions.length) return;
+  
+  let instr = state.program.instructions[state.pc].raw;
+  let highlightLine = state.program.instructions[state.pc].lineNumber;
 
-    // Helper: get register or value
-    const getVal = v => {
-      if (REG_NAMES.includes(v)) return regCopy[v];
-      if (/^\d+$/.test(v)) return parseInt(v);
-      if (/^R\d\+\d+$/.test(v)) { // e.g. R1+1
-        let [r, add] = v.split('+');
-        return (regCopy[r]||0) + parseInt(add);
-      }
-      err = `Invalid value: ${v}`;
-      return 0;
-    };
+  // Parse instruction
+  let words = instr.split(/\s+/);
+  let op = words[0].toLowerCase();
 
-    // Helper: get address [base+Rx]
-    const parseAddr = expr => {
-      let m = expr.match(/^(\d+)\+([Rr]\d)$/);
-      if (!m) return null;
-      let base = parseInt(m[1]);
-      let reg = m[2].toUpperCase();
-      if (!REG_NAMES.includes(reg)) return null;
-      let addr = base + regCopy[reg];
-      if (addr < 0 || addr >= 100) {
-        err = `Memory address out of bounds: ${addr}`;
-        return null;
-      }
-      return addr;
-    };
+  let nextPC = state.pc + 1;
+  let regCopy = {...state.registers};
+  let memCopy = [...state.memory];
+  let stackCopy = [...state.stack];
+  let err = "";
 
-    // Execute instruction
-    try {
-      switch(op) {
-        case 'mov': {
-          // mov <target> <source>
-          // mov Ry [base+Rx] / mov [base+Rx] Ry
-          if (REG_NAMES.includes(words[1]) && REG_NAMES.includes(words[2])) {
-            regCopy[words[1]] = regCopy[words[2]];
-          } else if (REG_NAMES.includes(words[1]) && /^\d+$/.test(words[2])) {
-            regCopy[words[1]] = parseInt(words[2]);
-          } else if (REG_NAMES.includes(words[1]) && /^R\d\+\d+$/.test(words[2])) {
-            regCopy[words[1]] = getVal(words[2]);
-          } else if (REG_NAMES.includes(words[1]) && /^\[\d+\+[Rr]\d\]$/.test(words[2])) {
-            let addr = parseAddr(words[2].slice(1,-1));
-            if (addr!==null) regCopy[words[1]] = memCopy[addr];
-          } else if (/^\[\d+\+[Rr]\d\]$/.test(words[1]) && REG_NAMES.includes(words[2])) {
-            let addr = parseAddr(words[1].slice(1,-1));
-            if (addr!==null) memCopy[addr] = regCopy[words[2]];
-          } else {
-            err = `Invalid mov syntax: ${instr}`;
-          }
-          break;
+  // Execute instruction
+  try {
+    switch(op) {
+      case 'mov': {
+        // mov <target> <source>
+        // mov Ry [base+Rx] / mov [base+Rx] Ry
+        if (REG_NAMES.includes(words[1]) && REG_NAMES.includes(words[2])) {
+          regCopy[words[1]] = regCopy[words[2]];
+        } else if (REG_NAMES.includes(words[1]) && /^\d+$/.test(words[2])) {
+          regCopy[words[1]] = parseInt(words[2]);
+        } else if (REG_NAMES.includes(words[1]) && /^R\d\+\d+$/.test(words[2])) {
+          regCopy[words[1]] = getVal(words[2], regCopy);
+        } else if (REG_NAMES.includes(words[1]) && /^\[\d+\+[Rr]\d\]$/.test(words[2])) {
+          let addr = parseAddr(words[2].slice(1,-1), regCopy);
+          if (addr!==null) regCopy[words[1]] = memCopy[addr];
+        } else if (/^\[\d+\+[Rr]\d\]$/.test(words[1]) && REG_NAMES.includes(words[2])) {
+          let addr = parseAddr(words[1].slice(1,-1), regCopy);
+          if (addr!==null) memCopy[addr] = regCopy[words[2]];
+        } else {
+          err = `Invalid mov syntax: ${instr}`;
         }
-        case 'cmp': {
-          if (REG_NAMES.includes(words[1]) && /^\d+$/.test(words[2])) {
-            regCopy.FLAG = evalCmp(regCopy[words[1]], parseInt(words[2]));
-          } else if (REG_NAMES.includes(words[1]) && REG_NAMES.includes(words[2])) {
-            regCopy.FLAG = evalCmp(regCopy[words[1]], regCopy[words[2]]);
-          } else {
-            err = `Invalid cmp syntax: ${instr}`;
-          }
-          break;
+        break;
+      }
+      case 'cmp': {
+        if (REG_NAMES.includes(words[1]) && /^\d+$/.test(words[2])) {
+          regCopy.FLAG = evalCmp(regCopy[words[1]], parseInt(words[2]));
+        } else if (REG_NAMES.includes(words[1]) && REG_NAMES.includes(words[2])) {
+          regCopy.FLAG = evalCmp(regCopy[words[1]], regCopy[words[2]]);
+        } else {
+          err = `Invalid cmp syntax: ${instr}`;
         }
-        case 'jmp': {
+        break;
+      }
+      case 'jmp': {
+        let lbl = words[1];
+        if (state.program.labels.hasOwnProperty(lbl)) {
+          nextPC = state.program.labels[lbl];
+        } else {
+          err = `Label not found: ${lbl}`;
+        }
+        break;
+      }
+      case 'je': {
+        if (regCopy.FLAG === 0) {
           let lbl = words[1];
-          if (program.labels.hasOwnProperty(lbl)) {
-            nextPC = program.labels[lbl];
+          if (state.program.labels.hasOwnProperty(lbl)) {
+            nextPC = state.program.labels[lbl];
           } else {
             err = `Label not found: ${lbl}`;
           }
-          break;
         }
-        case 'je': {
-          if (regCopy.FLAG === 0) {
-            let lbl = words[1];
-            if (program.labels.hasOwnProperty(lbl)) {
-              nextPC = program.labels[lbl];
-            } else {
-              err = `Label not found: ${lbl}`;
-            }
-          }
-          break;
-        }
-        case 'jne': {
-          if (regCopy.FLAG !== 0) {
-            let lbl = words[1];
-            if (program.labels.hasOwnProperty(lbl)) {
-              nextPC = program.labels[lbl];
-            } else {
-              err = `Label not found: ${lbl}`;
-            }
-          }
-          break;
-        }
-        case 'jg': {
-          if (regCopy.FLAG === 1) {
-            let lbl = words[1];
-            if (program.labels.hasOwnProperty(lbl)) {
-              nextPC = program.labels[lbl];
-            } else {
-              err = `Label not found: ${lbl}`;
-            }
-          }
-          break;
-        }
-        case 'jge': {
-          if (regCopy.FLAG === 0 || regCopy.FLAG === 1) {
-            let lbl = words[1];
-            if (program.labels.hasOwnProperty(lbl)) {
-              nextPC = program.labels[lbl];
-            } else {
-              err = `Label not found: ${lbl}`;
-            }
-          }
-          break;
-        }
-        case 'jl': {
-          if (regCopy.FLAG === -1) {
-            let lbl = words[1];
-            if (program.labels.hasOwnProperty(lbl)) {
-              nextPC = program.labels[lbl];
-            } else {
-              err = `Label not found: ${lbl}`;
-            }
-          }
-          break;
-        }
-        case 'jle': {
-          if (regCopy.FLAG === 0 || regCopy.FLAG === -1) {
-            let lbl = words[1];
-            if (program.labels.hasOwnProperty(lbl)) {
-              nextPC = program.labels[lbl];
-            } else {
-              err = `Label not found: ${lbl}`;
-            }
-          }
-          break;
-        }
-        case 'push': {
-          if (REG_NAMES.includes(words[1])) {
-            stackCopy.push(regCopy[words[1]]);
-          } else {
-            err = `Invalid push syntax: ${instr}`;
-          }
-          break;
-        }
-        case 'pop': {
-          if (REG_NAMES.includes(words[1])) {
-            if (stackCopy.length === 0) {
-              err = `Stack underflow`;
-            } else {
-              regCopy[words[1]] = stackCopy.pop();
-            }
-          } else {
-            err = `Invalid pop syntax: ${instr}`;
-          }
-          break;
-        }
-        case 'halt': {
-          setHalted(true);
-          break;
-        }
-        default:
-          err = `Unknown instruction: ${op}`;
+        break;
       }
-    } catch(e) {
-      err = "Runtime error: " + e.message;
+      case 'jne': {
+        if (regCopy.FLAG !== 0) {
+          let lbl = words[1];
+          if (state.program.labels.hasOwnProperty(lbl)) {
+            nextPC = state.program.labels[lbl];
+          } else {
+            err = `Label not found: ${lbl}`;
+          }
+        }
+        break;
+      }
+      case 'jg': {
+        if (regCopy.FLAG === 1) {
+          let lbl = words[1];
+          if (state.program.labels.hasOwnProperty(lbl)) {
+            nextPC = state.program.labels[lbl];
+          } else {
+            err = `Label not found: ${lbl}`;
+          }
+        }
+        break;
+      }
+      case 'jge': {
+        if (regCopy.FLAG === 0 || regCopy.FLAG === 1) {
+          let lbl = words[1];
+          if (state.program.labels.hasOwnProperty(lbl)) {
+            nextPC = state.program.labels[lbl];
+          } else {
+            err = `Label not found: ${lbl}`;
+          }
+        }
+        break;
+      }
+      case 'jl': {
+        if (regCopy.FLAG === -1) {
+          let lbl = words[1];
+          if (state.program.labels.hasOwnProperty(lbl)) {
+            nextPC = state.program.labels[lbl];
+          } else {
+            err = `Label not found: ${lbl}`;
+          }
+        }
+        break;
+      }
+      case 'jle': {
+        if (regCopy.FLAG === 0 || regCopy.FLAG === -1) {
+          let lbl = words[1];
+          if (state.program.labels.hasOwnProperty(lbl)) {
+            nextPC = state.program.labels[lbl];
+          } else {
+            err = `Label not found: ${lbl}`;
+          }
+        }
+        break;
+      }
+      case 'push': {
+        if (REG_NAMES.includes(words[1])) {
+          stackCopy.push(regCopy[words[1]]);
+        } else {
+          err = `Invalid push syntax: ${instr}`;
+        }
+        break;
+      }
+      case 'pop': {
+        if (REG_NAMES.includes(words[1])) {
+          if (stackCopy.length === 0) {
+            err = `Stack underflow`;
+          } else {
+            regCopy[words[1]] = stackCopy.pop();
+          }
+        } else {
+          err = `Invalid pop syntax: ${instr}`;
+        }
+        break;
+      }
+      case 'halt': {
+        updateState({
+          registers: regCopy,
+          memory: memCopy,
+          stack: stackCopy,
+          pc: nextPC,
+          halted: true,
+          error: "",
+          editMode: false,
+          highlightLine: highlightLine
+        });
+        return;
+      }
+      default:
+        err = `Unknown instruction: ${op}`;
     }
+  } catch(e) {
+    err = "Runtime error: " + e.message;
+  }
 
-    // Set states
-    if (err) {
-      setError(err);
-      setHalted(true);
-      return;
+  // Set states
+  if (err) {
+    updateState({
+      error: err,
+      halted: true,
+      highlightLine: highlightLine
+    });
+    return;
+  }
+  
+  // End if halt or out of instructions
+  let halted = nextPC >= state.program.instructions.length;
+  
+  updateState({
+    registers: regCopy,
+    memory: memCopy,
+    stack: stackCopy,
+    pc: nextPC,
+    halted: halted,
+    error: "",
+    editMode: false,
+    highlightLine: highlightLine
+  });
+}
+
+// Rendering functions
+function createElement(tag, attributes = {}, ...children) {
+  const element = document.createElement(tag);
+  
+  for (const [key, value] of Object.entries(attributes)) {
+    if (key === 'className') {
+      element.className = value;
+    } else if (key.startsWith('on') && typeof value === 'function') {
+      element.addEventListener(key.slice(2).toLowerCase(), value);
+    } else if (key === 'style' && typeof value === 'object') {
+      Object.assign(element.style, value);
+    } else if (key === 'disabled') {
+      element.disabled = value;
+    } else {
+      element.setAttribute(key, value);
     }
-    setRegisters(regCopy);
-    setMemory(memCopy);
-    setStack(stackCopy);
-    setPC(nextPC);
+  }
+  
+  children.forEach(child => {
+    if (typeof child === 'string') {
+      element.appendChild(document.createTextNode(child));
+    } else if (child && child.nodeType) {
+      element.appendChild(child);
+    }
+  });
+  
+  return element;
+}
 
-    // End if halt or out of instructions
-    if (nextPC >= program.instructions.length) setHalted(true);
-    setEditMode(false);
-  };
+function renderEditorSection() {
+  const textarea = createElement('textarea', {
+    rows: 8,
+    value: state.code,
+    disabled: !state.editMode,
+    style: { resize: 'vertical' },
+    onInput: (e) => updateCode(e.target.value)
+  });
+  textarea.value = state.code;
 
-  // UI
-  return (
-    <div className="container">
-      <div className="section">
-        <div className="label">Assembly Editor</div>
-        <textarea
-          rows={8}
-          value={code}
-          disabled={!editMode}
-          onChange={e => setCode(e.target.value)}
-          style={{resize:'vertical'}}
-        />
-        {editMode && (
-          <div style={{fontSize:"0.9em",color:"#ccc",marginTop:2}}>
-            You can edit code, registers, and memory before running.
-          </div>
-        )}
-      </div>
-      <div className="section">
-        <div className="label">Registers</div>
-        <div className="row">
-          {REG_NAMES.map(r =>
-            <div key={r}>
-              {r}: {editMode ?
-                <input
-                  type="number"
-                  value={registers[r]}
-                  onChange={e=>handleRegEdit(r,e.target.value)}
-                  style={{width:"50px"}}
-                /> :
-                <span style={{fontWeight:"bold"}}>{registers[r]}</span>
-              }
-            </div>
-          )}
-          <div>
-            FLAG: <span style={{fontWeight:"bold"}}>{registers.FLAG}</span>
-          </div>
-        </div>
-      </div>
-      <div className="section">
-        <div className="label">Memory (100 bytes)</div>
-        <div className="memory-view">
-          {memory.map((v,i)=>
-            <div className="memcell" key={i}>
-              {editMode ?
-                <input
-                  type="number"
-                  value={v}
-                  onChange={e=>handleMemEdit(i,e.target.value)}
-                  style={{width:"20px"}}
-                />:
-                <span>{v}</span>
-              }
-            </div>
-          )}
-        </div>
-        <div style={{fontSize:"0.8em",color:"#aaa"}}>Addresses: 0 – 99</div>
-      </div>
-      <div className="section">
-        <div className="label">Stack</div>
-        <div className="stack-view">
-          {stack.length === 0 && <div style={{color:"#888"}}>(empty)</div>}
-          {stack.map((v,i)=>
-            <div className="stackcell" key={i}>{v}</div>
-          )}
-        </div>
-      </div>
-      <div className="section">
-        <div className="label">Step Execution</div>
-        <div>
-          <button onClick={handleStep} disabled={halted}>Next Step</button>
-          <button onClick={handleReset}>Reset</button>
-        </div>
-        <div style={{marginTop:4}}>
-          <span>PC: {pc} </span>
-          {halted && <span style={{color:"#ff7878"}}>HALTED</span>}
-        </div>
-        {error && <div className="error">Error: {error}</div>}
-      </div>
-      <div className="section">
-        <div className="label">Program Listing</div>
-        <div style={{fontSize:"0.95em",whiteSpace:"pre-wrap"}}>
-        {code.split('\n').map((line,i)=>
-          <div
-            key={i}
-            className={highlightLine===i ? "editor-highlight" : ""}
-            style={{
-              background:highlightLine===i?'#373':'none',
-              color:highlightLine===i?'#fff':'inherit',
-              borderRadius:'2px',
-              padding:"0 2px"
-            }}>
-            {i+1}: {line}
-          </div>
-        )}
-        </div>
-      </div>
-      <div style={{fontSize:"0.9em",color:"#aaa",marginTop:8}}>
-        <b>Instructions:</b> mov, cmp, jmp, je, jne, jg, jge, jl, jle, push, pop, halt<br/>
-        Registers: R0–R3, FLAG (-1/0/1)<br/>
-        Memory: 100 bytes, addresses 0–99<br/>
-        Stack: separate from memory<br/>
-        Comments: use <code>;</code>
-      </div>
-    </div>
+  const hint = state.editMode ? createElement('div', {
+    style: { fontSize: "0.9em", color: "#ccc", marginTop: "2px" }
+  }, "You can edit code, registers, and memory before running.") : null;
+
+  return createElement('div', { className: 'section' },
+    createElement('div', { className: 'label' }, 'Assembly Editor'),
+    textarea,
+    hint
   );
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(<Simulator />);
+function renderRegistersSection() {
+  const regInputs = REG_NAMES.map(r => {
+    if (state.editMode) {
+      const input = createElement('input', {
+        type: 'number',
+        value: state.registers[r],
+        style: { width: '50px' },
+        onInput: (e) => handleRegEdit(r, e.target.value)
+      });
+      input.value = state.registers[r];
+      return createElement('div', {}, 
+        `${r}: `,
+        input
+      );
+    } else {
+      return createElement('div', {}, 
+        `${r}: `,
+        createElement('span', { style: { fontWeight: 'bold' } }, state.registers[r])
+      );
+    }
+  });
+
+  const flagDisplay = createElement('div', {},
+    'FLAG: ',
+    createElement('span', { style: { fontWeight: 'bold' } }, state.registers.FLAG)
+  );
+
+  return createElement('div', { className: 'section' },
+    createElement('div', { className: 'label' }, 'Registers'),
+    createElement('div', { className: 'row' }, ...regInputs, flagDisplay)
+  );
+}
+
+function renderMemorySection() {
+  const memCells = state.memory.map((v, i) => {
+    if (state.editMode) {
+      const input = createElement('input', {
+        type: 'number',
+        value: v,
+        style: { width: '20px' },
+        onInput: (e) => handleMemEdit(i, e.target.value)
+      });
+      input.value = v;
+      return createElement('div', { className: 'memcell' }, input);
+    } else {
+      return createElement('div', { className: 'memcell' }, createElement('span', {}, v));
+    }
+  });
+
+  return createElement('div', { className: 'section' },
+    createElement('div', { className: 'label' }, 'Memory (100 bytes)'),
+    createElement('div', { className: 'memory-view' }, ...memCells),
+    createElement('div', { style: { fontSize: '0.8em', color: '#aaa' } }, 'Addresses: 0 – 99')
+  );
+}
+
+function renderStackSection() {
+  const stackCells = state.stack.length === 0 
+    ? [createElement('div', { style: { color: '#888' } }, '(empty)')]
+    : state.stack.map((v, i) => createElement('div', { className: 'stackcell' }, v));
+
+  return createElement('div', { className: 'section' },
+    createElement('div', { className: 'label' }, 'Stack'),
+    createElement('div', { className: 'stack-view' }, ...stackCells)
+  );
+}
+
+function renderControlSection() {
+  const stepButton = createElement('button', {
+    disabled: state.halted || !state.program || state.pc >= state.program.instructions.length,
+    onClick: handleStep
+  }, 'Next Step');
+
+  const resetButton = createElement('button', {
+    onClick: handleReset
+  }, 'Reset');
+
+  const statusText = createElement('span', {}, `PC: ${state.pc} `);
+  const haltedText = state.halted ? createElement('span', { style: { color: '#ff7878' } }, 'HALTED') : null;
+
+  const errorDiv = state.error ? createElement('div', { className: 'error' }, `Error: ${state.error}`) : null;
+
+  return createElement('div', { className: 'section' },
+    createElement('div', { className: 'label' }, 'Step Execution'),
+    createElement('div', {}, stepButton, resetButton),
+    createElement('div', { style: { marginTop: '4px' } }, statusText, haltedText),
+    errorDiv
+  );
+}
+
+function renderProgramListing() {
+  const lines = state.code.split('\n').map((line, i) => {
+    const isHighlighted = state.highlightLine === i;
+    return createElement('div', {
+      className: isHighlighted ? 'editor-highlight' : '',
+      style: {
+        background: isHighlighted ? '#373' : 'none',
+        color: isHighlighted ? '#fff' : 'inherit',
+        borderRadius: '2px',
+        padding: '0 2px'
+      }
+    }, `${i + 1}: ${line}`);
+  });
+
+  return createElement('div', { className: 'section' },
+    createElement('div', { className: 'label' }, 'Program Listing'),
+    createElement('div', { style: { fontSize: '0.95em', whiteSpace: 'pre-wrap' } }, ...lines)
+  );
+}
+
+function renderInstructions() {
+  return createElement('div', { style: { fontSize: '0.9em', color: '#aaa', marginTop: '8px' } },
+    createElement('b', {}, 'Instructions:'), ' mov, cmp, jmp, je, jne, jg, jge, jl, jle, push, pop, halt',
+    createElement('br'),
+    'Registers: R0–R3, FLAG (-1/0/1)',
+    createElement('br'),
+    'Memory: 100 bytes, addresses 0–99',
+    createElement('br'),
+    'Stack: separate from memory',
+    createElement('br'),
+    'Comments: use ', createElement('code', {}, ';')
+  );
+}
+
+function render() {
+  const container = createElement('div', { className: 'container' },
+    renderEditorSection(),
+    renderRegistersSection(),
+    renderMemorySection(),
+    renderStackSection(),
+    renderControlSection(),
+    renderProgramListing(),
+    renderInstructions()
+  );
+
+  const root = document.getElementById('root');
+  root.innerHTML = '';
+  root.appendChild(container);
+}
+
+// Initialize
+document.addEventListener('DOMContentLoaded', function() {
+  render();
+});
+
+  </script>
   </script>
 </body>
 </html>
