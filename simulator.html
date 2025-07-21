@@ -33,6 +33,15 @@
       padding: 4px;
       box-sizing: border-box;
     }
+    /* Hide number input spinner buttons */
+    input[type="number"]::-webkit-outer-spin-button,
+    input[type="number"]::-webkit-inner-spin-button {
+      -webkit-appearance: none;
+      margin: 0;
+    }
+    input[type="number"] {
+      -moz-appearance: textfield;
+    }
     .section {
       background: #292929;
       padding: 8px;
@@ -56,6 +65,8 @@
       display: flex;
       flex-wrap: wrap;
       gap: 2px;
+      height: 200px;
+      overflow-y: auto;
     }
     .memcell {
       width: 28px;
@@ -78,6 +89,8 @@
       display: flex;
       flex-direction: column-reverse;
       gap: 2px;
+      height: 200px;
+      overflow-y: auto;
     }
     .stackcell {
       background: #444;
@@ -238,12 +251,16 @@ function updateCode(newCode) {
 
 function handleRegEdit(reg, val) {
   let v = Number(val) || 0;
+  // Clamp value between 0 and 255
+  v = Math.max(0, Math.min(255, v));
   state.registers[reg] = v;
   render();
 }
 
 function handleMemEdit(idx, val) {
   let v = Number(val) || 0;
+  // Clamp value between 0 and 255
+  v = Math.max(0, Math.min(255, v));
   state.memory[idx] = v;
   render();
 }
@@ -505,6 +522,8 @@ function renderRegistersSection() {
     if (state.editMode) {
       const input = createElement('input', {
         type: 'number',
+        min: 0,
+        max: 255,
         value: state.registers[r],
         style: { width: '50px' },
         onInput: (e) => handleRegEdit(r, e.target.value)
@@ -538,6 +557,8 @@ function renderMemorySection() {
     if (state.editMode) {
       const input = createElement('input', {
         type: 'number',
+        min: 0,
+        max: 255,
         value: v,
         style: { width: '20px' },
         onInput: (e) => handleMemEdit(i, e.target.value)
