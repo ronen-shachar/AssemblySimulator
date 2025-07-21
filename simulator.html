@@ -272,8 +272,12 @@ function handleStep() {
   let op = words[0].toLowerCase();
 
   let nextPC = state.pc + 1;
-  let regCopy = {...state.registers};
+  let regCopy = {...INIT_REGS, ...state.registers};
   let memCopy = [...state.memory];
+  // Ensure memory array is always 100 elements
+  while (memCopy.length < 100) {
+    memCopy.push(0);
+  }
   let stackCopy = [...state.stack];
   let err = "";
 
@@ -407,7 +411,7 @@ function handleStep() {
       }
       case 'halt': {
         updateState({
-          registers: regCopy,
+          registers: {...INIT_REGS, ...regCopy},
           memory: memCopy,
           stack: stackCopy,
           pc: nextPC,
@@ -439,7 +443,7 @@ function handleStep() {
   let halted = nextPC >= state.program.instructions.length;
   
   updateState({
-    registers: regCopy,
+    registers: {...INIT_REGS, ...regCopy},
     memory: memCopy,
     stack: stackCopy,
     pc: nextPC,
@@ -469,8 +473,8 @@ function createElement(tag, attributes = {}, ...children) {
   }
   
   children.forEach(child => {
-    if (typeof child === 'string') {
-      element.appendChild(document.createTextNode(child));
+    if (typeof child === 'string' || typeof child === 'number') {
+      element.appendChild(document.createTextNode(String(child)));
     } else if (child && child.nodeType) {
       element.appendChild(child);
     }
@@ -502,14 +506,15 @@ function renderEditorSection() {
 
 function renderRegistersSection() {
   const regInputs = REG_NAMES.map(r => {
+    const regValue = state.registers[r] !== undefined ? state.registers[r] : 0;
     if (state.editMode) {
       const input = createElement('input', {
         type: 'number',
-        value: state.registers[r],
+        value: regValue,
         style: { width: '50px' },
         onInput: (e) => handleRegEdit(r, e.target.value)
       });
-      input.value = state.registers[r];
+      input.value = regValue;
       return createElement('div', {}, 
         `${r}: `,
         input
@@ -517,14 +522,15 @@ function renderRegistersSection() {
     } else {
       return createElement('div', {}, 
         `${r}: `,
-        createElement('span', { style: { fontWeight: 'bold' } }, state.registers[r])
+        createElement('span', { style: { fontWeight: 'bold' } }, regValue)
       );
     }
   });
 
+  const flagValue = state.registers.FLAG !== undefined ? state.registers.FLAG : 0;
   const flagDisplay = createElement('div', {},
     'FLAG: ',
-    createElement('span', { style: { fontWeight: 'bold' } }, state.registers.FLAG)
+    createElement('span', { style: { fontWeight: 'bold' } }, flagValue)
   );
 
   return createElement('div', { className: 'section' },
@@ -534,18 +540,25 @@ function renderRegistersSection() {
 }
 
 function renderMemorySection() {
-  const memCells = state.memory.map((v, i) => {
+  // Ensure we always render 100 memory cells
+  const fullMemory = [...state.memory];
+  while (fullMemory.length < 100) {
+    fullMemory.push(0);
+  }
+  
+  const memCells = fullMemory.map((v, i) => {
+    const cellValue = v !== undefined ? v : 0;
     if (state.editMode) {
       const input = createElement('input', {
         type: 'number',
-        value: v,
+        value: cellValue,
         style: { width: '20px' },
         onInput: (e) => handleMemEdit(i, e.target.value)
       });
-      input.value = v;
+      input.value = cellValue;
       return createElement('div', { className: 'memcell' }, input);
     } else {
-      return createElement('div', { className: 'memcell' }, createElement('span', {}, v));
+      return createElement('div', { className: 'memcell' }, createElement('span', {}, cellValue));
     }
   });
 
@@ -557,9 +570,12 @@ function renderMemorySection() {
 }
 
 function renderStackSection() {
-  const stackCells = state.stack.length === 0 
+  const stackCells = (!state.stack || state.stack.length === 0) 
     ? [createElement('div', { style: { color: '#888' } }, '(empty)')]
-    : state.stack.map((v, i) => createElement('div', { className: 'stackcell' }, v));
+    : state.stack.map((v, i) => {
+        const stackValue = v !== undefined ? v : 0;
+        return createElement('div', { className: 'stackcell' }, stackValue);
+      });
 
   return createElement('div', { className: 'section' },
     createElement('div', { className: 'label' }, 'Stack'),
